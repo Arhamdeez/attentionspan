@@ -1,12 +1,13 @@
 """
-Gaze Attention Detector — reveal an image when you look away from the screen.
+Gaze Attention Detector — reveal an image or play a video when you look away.
 
 Usage:
-    python main.py [--image path/to/reveal.png] [--frames 30]
+    python main.py [--image path/to/reveal.png]
+    python main.py [--video path/to/reveal.mp4]
 
 - Camera runs; when you look at the camera = "attention".
-- When you look away for N consecutive frames, the image is shown in a separate window.
-- As soon as you look back, the window closes.
+- When you look away for N consecutive frames, the image (or video) is shown.
+- As soon as you look back, it hides. Video loops while you're looking away.
 - Press 'q' to quit.
 """
 # Reduce noisy logs from MediaPipe / TensorFlow Lite / protobuf
@@ -27,8 +28,9 @@ import numpy as np
 from gaze_detector import GazeDetector, GazeState
 
 
-# Default image to reveal when looking away (create a simple placeholder if missing)
+# Default media to reveal when looking away
 DEFAULT_IMAGE_PATH = pathlib.Path(__file__).parent / "assets" / "reveal.png"
+DEFAULT_VIDEO_PATH = pathlib.Path(__file__).parent / "assets" / "reveal.mp4"
 LOOK_AWAY_FRAMES_TO_TRIGGER = 6  # ~0.2 sec at 30fps; use --frames to tune
 WINDOW_MAIN = "Gaze Attention — look away to reveal"
 
@@ -67,13 +69,26 @@ def load_reveal_image(path: pathlib.Path) -> np.ndarray:
 
 
 def run(
-    reveal_image_path: pathlib.Path = DEFAULT_IMAGE_PATH,
+    reveal_image_path: pathlib.Path | None = DEFAULT_IMAGE_PATH,
+    reveal_video_path: pathlib.Path | None = None,
     look_away_frames: int = LOOK_AWAY_FRAMES_TO_TRIGGER,
     camera_id: int = 0,
     yaw_threshold_deg: float = 25.0,
     pitch_threshold_deg: float = 25.0,
 ) -> None:
-    reveal_image = load_reveal_image(reveal_image_path)
+    use_video = reveal_video_path is not None and reveal_video_path.exists()
+    reveal_image: np.ndarray | None = None
+    video_cap: cv2.VideoCapture | None = None
+
+    if use_video:
+        video_cap = cv2.VideoCapture(str(reveal_video_path))
+        if not video_cap.isOpened():
+            print("Warning: Could not open video, falling back to image.", file=sys.stderr)
+            use_video = False
+            reveal_image = load_reveal_image(reveal_image_path or DEFAULT_IMAGE_PATH)
+    else:
+        reveal_image = load_reveal_image(reveal_image_path or DEFAULT_IMAGE_PATH)
+
     detector = GazeDetector(
         look_away_threshold=0.25,
         yaw_threshold_deg=yaw_threshold_deg,
@@ -141,10 +156,22 @@ def run(
                 if gaze.looking_at_screen or not gaze.face_detected:
                     reveal_visible = False
 
-            # Single window: show reveal image or camera (avoids two dock icons on macOS)
+            # Single window: show reveal (image or video frame) or camera
             if reveal_visible:
-                cv2.imshow(WINDOW_MAIN, reveal_image)
+                if use_video and video_cap is not None:
+                    ok_v, video_frame = video_cap.read()
+                    if not ok_v:
+                        video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ok_v, video_frame = video_cap.read()
+                    if ok_v:
+                        cv2.imshow(WINDOW_MAIN, video_frame)
+                    else:
+                        cv2.imshow(WINDOW_MAIN, reveal_image or make_placeholder_image())
+                else:
+                    cv2.imshow(WINDOW_MAIN, reveal_image or make_placeholder_image())
             else:
+                if use_video and video_cap is not None:
+                    video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 cv2.imshow(WINDOW_MAIN, frame)
 
             key = cv2.waitKey(1) & 0xFF
@@ -152,19 +179,27 @@ def run(
                 break
     finally:
         cap.release()
+        if video_cap is not None:
+            video_cap.release()
         detector.close()
         cv2.destroyAllWindows()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Reveal an image when you look away from the camera."
+        description="Reveal an image or play a video when you look away from the camera."
     )
     parser.add_argument(
         "--image",
         type=pathlib.Path,
-        default=DEFAULT_IMAGE_PATH,
-        help="Path to image to show when looking away",
+        default=None,
+        help="Path to image to show when looking away (used if --video not set)",
+    )
+    parser.add_argument(
+        "--video",
+        type=pathlib.Path,
+        default=None,
+        help="Path to video to play when looking away (loops); overrides --image",
     )
     parser.add_argument(
         "--frames",
@@ -194,7 +229,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     run(
-        reveal_image_path=args.image,
+        reveal_image_path=args.image or DEFAULT_IMAGE_PATH,
+        reveal_video_path=args.video,
         look_away_frames=args.frames,
         camera_id=args.camera,
         yaw_threshold_deg=args.yaw,
